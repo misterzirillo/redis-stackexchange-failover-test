@@ -1,0 +1,57 @@
+version: '3.7'
+
+services:
+  redis-master:
+    image: redis:6-alpine
+    volumes:
+      - "./.data:/data"
+    networks:
+      - redis
+    ports:
+      - "6379:6379"
+ 
+  redis-slave:
+    image: redis:6-alpine
+    command: redis-server --port 6380 --slaveof redis-master 6379
+    networks:
+      - redis
+    volumes:
+      - "./.data:/data"
+    ports:
+      - "6380:6380"
+     
+  # Instance 1
+  redis-sentinel:
+    build: 
+      context: ./redis-sentinel
+    networks:
+      - redis
+    depends_on:
+      - redis-master
+    ports:
+      - "26379:26379"
+ 
+  # Instance 2
+  redis-sentinel2:
+    build: 
+      context: ./redis-sentinel
+    networks:
+      - redis
+    depends_on:
+      - redis-master
+    ports:
+      - "26380:26379"
+ 
+  # Instance 3
+  redis-sentinel3:
+    build: 
+      context: ./redis-sentinel
+    networks:
+      - redis
+    depends_on:
+      - redis-master
+    ports:
+      - "26381:26379"
+
+networks:
+  redis:
