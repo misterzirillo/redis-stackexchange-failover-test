@@ -2,11 +2,13 @@
 
 open StackExchange.Redis
 
+// matching endpoints defined in docker compose file
 let sentinelEndpoints =
     [ "localhost", 26379
       "localhost", 26380
       "localhost", 26381 ]
 
+// matching sentinel service name
 let serviceName = "myredis"
 
 // https://stackexchange.github.io/StackExchange.Redis/ThreadTheft
@@ -15,12 +17,11 @@ ConnectionMultiplexer.SetFeatureFlag("preventthreadtheft", true)
 let connectSentinel () =
     async {
         let sentinelConfig = new ConfigurationOptions()
+        sentinelConfig.ServiceName <- serviceName
+        sentinelConfig.AbortOnConnectFail <- false
 
         for host, port in sentinelEndpoints do
             sentinelConfig.EndPoints.Add(host, port)
-
-        sentinelConfig.ServiceName <- serviceName
-        sentinelConfig.AbortOnConnectFail <- false
 
         let! connection =
             ConnectionMultiplexer.SentinelConnectAsync(sentinelConfig)
@@ -32,31 +33,25 @@ let connectSentinel () =
 let connectMaster (sentinelMultiplexer: ConnectionMultiplexer) =
     let config = new ConfigurationOptions()
     config.ServiceName <- serviceName
+    sentinelMultiplexer.GetSentinelMasterConnection(config)
 
-    let connection =
-        sentinelMultiplexer.GetSentinelMasterConnection(config)
-
-    connection
-
-
-let doWithRetries (maxTries: int) asyncOperation : Async<Result<'a, string>> =
+let doWithRetries (maxTries: uint) asyncOperation : Async<Result<'a, string>> =
     let rec repeatAsyncOperation retries =
         async {
-            if retries < maxTries then
+            if retries <= maxTries then
                 try
                     let! it = asyncOperation
                     return Ok it
                 with
                 | ex ->
-                    printfn "An exception occurred on retry %d" retries
+                    printfn "An exception occurred on try %d" retries
                     printfn "%A" ex
-                    return! repeatAsyncOperation (retries + 1)
+                    return! repeatAsyncOperation (retries + 1u)
             else
                 return Error "Maximum retries reached"
-
         }
 
-    repeatAsyncOperation 0
+    repeatAsyncOperation 0u
 
 
 // get connection, generate a bunch of traffic
@@ -64,44 +59,36 @@ async {
     use! sentinelConnection = connectSentinel ()
     use masterConnection = connectMaster sentinelConnection
 
+    let incrementKey =
+        async {
+            let db = masterConnection.GetDatabase()
 
-    // graceful shutdown hook
-    let mutable kill = false
-    System.AppDomain.CurrentDomain.ProcessExit.Add(fun _ -> kill <- true)
+            return!
+                db.StringIncrementAsync(RedisKey "key")
+                |> Async.AwaitTask
+        }
 
-    while not kill do
-        let incrementKey =
-            async {
-                let db = masterConnection.GetDatabase()
+    let mutable loop = true
 
-                return!
-                    db.StringIncrementAsync(RedisKey "key")
-                    |> Async.AwaitTask
-            }
-
-        let! result = doWithRetries 5 incrementKey
-
-        match result with
+    while loop do
+        match! doWithRetries 5u incrementKey with
         | Ok newCount ->
             printfn "Count: %d" newCount
 
             for endpoint in masterConnection.GetEndPoints() do
                 let server = masterConnection.GetServer endpoint
-                let isReplica = server.IsReplica
 
-                printfn
-                    "endpoint %A : %s"
-                    endpoint
-                    (if isReplica then
-                         "replica"
-                     else
-                         "master")
+                let isReplica =
+                    if server.IsReplica then
+                        "replica"
+                    else
+                        "master"
+
+                printfn "Endpoint %A : %s" endpoint isReplica
 
             do! Async.Sleep 5000
-        | Error e ->
-            printfn "Terminating: %s" e
-            kill <- true
-
-    return ()
+        | Error _ ->
+            printfn "Retries exceeded; terminating"
+            loop <- false
 }
 |> Async.RunSynchronously
